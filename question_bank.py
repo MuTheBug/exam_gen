@@ -16,11 +16,33 @@ def _clean_lines(lines):
     cleaned = []
     for line in lines:
         stripped = line.strip()
-        # Skip standalone page numbers
         if stripped.isdigit() and len(stripped) <= 3:
             continue
         cleaned.append(stripped)
     return cleaned
+
+
+def _clean_question_text(text):
+    """Clean extracted question text: remove blanks, dots, validate length."""
+    # Remove fill-in-the-blank patterns
+    text = re.sub(r'[.…·]{3,}', '..........', text)
+    # Remove leading/trailing dots and whitespace
+    text = text.strip().strip('.').strip()
+    # Collapse multiple spaces
+    text = re.sub(r'\s+', ' ', text)
+    return text
+
+
+def _is_valid_question(text):
+    """Check if extracted text is a valid question (not garbage)."""
+    cleaned = _clean_question_text(text)
+    if len(cleaned) < 12:
+        return False
+    # Reject if it's mostly dots/blanks
+    alpha_chars = sum(1 for c in cleaned if c.isalpha())
+    if alpha_chars < 8:
+        return False
+    return True
 
 
 def _is_section_break(line):
@@ -29,14 +51,38 @@ def _is_section_break(line):
     return lower in SECTION_HEADERS
 
 
+def _join_paragraphs(lines):
+    """Join consecutive non-empty lines into paragraphs.
+    Blank lines separate paragraphs."""
+    paragraphs = []
+    current = []
+    is_first = True
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+        else:
+            # Treat the very first short line as a title (own paragraph)
+            if is_first and not current and len(stripped) < 40 and \
+               not stripped.endswith('.') and not stripped.endswith(','):
+                paragraphs.append(stripped)
+                is_first = False
+            else:
+                current.append(stripped)
+                is_first = False
+    if current:
+        paragraphs.append(" ".join(current))
+    return "\n\n".join(paragraphs)
+
+
 def _extract_reading_passage(lines):
     """Extract the main reading passage from unit text."""
     cleaned = _clean_lines(lines)
 
-    # Find the standalone "Reading" section header (not "Reading: ..." metadata)
     reading_start = None
     for i, line in enumerate(cleaned):
-        # Match standalone "Reading" header, not metadata like "Reading: History of Medicine"
         if line.strip().lower() == "reading":
             reading_start = i + 1
             break
@@ -44,93 +90,120 @@ def _extract_reading_passage(lines):
     if reading_start is None:
         return ""
 
-    # Skip past any sub-labels (a, b) and instruction lines until we hit passage text
-    # The passage is the main block of text after "Reading" before exercise markers
-    passage_lines = []
-    in_passage = False
+    # Skip pre-reading exercises (e.g., "Before you read the text, match...")
+    # We need to find where the actual passage starts (usually a title followed by
+    # long prose paragraphs), skipping instructions, word lists, and definitions.
+    skip_zone = False
+    passage_start = reading_start
+    found_blank_after_skip = False
     for i in range(reading_start, len(cleaned)):
         line = cleaned[i]
+        lower = line.lower().strip()
 
-        # Stop at section breaks
+        # Skip standalone sub-labels
+        if re.match(r'^[a-c]$', line):
+            skip_zone = True
+            found_blank_after_skip = False
+            continue
+        # Skip instruction lines
+        if lower.startswith("before you read") or lower.startswith("match the words") or \
+           lower.startswith("match these words") or lower.startswith("in pairs") or \
+           lower.startswith("in small groups") or lower.startswith("read the quote") or \
+           lower.startswith("discuss"):
+            skip_zone = True
+            found_blank_after_skip = False
+            continue
+        # Track blank lines in skip zone
+        if not line:
+            if skip_zone:
+                found_blank_after_skip = True
+            continue
+        # In skip zone, keep skipping numbered items, lettered defs, and short lines
+        if skip_zone:
+            if re.match(r'^\d+[\.\)]\s+', line) or re.match(r'^[a-h][\.\)]\s+', line):
+                found_blank_after_skip = False
+                continue
+            # Short continuation lines of definitions (< 50 chars, no capital start after blank)
+            if not found_blank_after_skip and len(line) < 50:
+                continue
+            # After a blank line + a substantial line = likely the passage title or start
+            if found_blank_after_skip and len(line) > 10:
+                passage_start = i
+                skip_zone = False
+                break
+            continue
+        # Not in skip zone: first substantial line is passage start
+        if len(line) > 15:
+            passage_start = i
+            break
+
+    # Now collect the passage text
+    passage_lines = []
+    for i in range(passage_start, len(cleaned)):
+        line = cleaned[i]
+
         if _is_section_break(line):
             break
-        # Stop at exercise markers (standalone a, b, c)
-        if re.match(r'^[a-c]$', line) and in_passage:
+        if re.match(r'^[a-c]$', line):
             break
-        # Stop at question/instruction markers
         lower = line.lower()
-        if in_passage and (
-            lower.startswith("answer the following") or
+        if (lower.startswith("answer the following") or
             lower.startswith("read the text") or
             lower.startswith("in pairs") or
             lower.startswith("in small groups") or
             lower.startswith("match these words") or
             lower.startswith("match the words") or
-            lower.startswith("before you read") or
-            lower.startswith("find words")
-        ):
+            lower.startswith("find words")):
             break
 
-        # Skip empty lines and sub-labels before passage starts
-        if not in_passage:
-            if not line or re.match(r'^[a-c]$', line):
-                continue
-            # Skip instruction lines
-            if lower.startswith("in pairs") or lower.startswith("in small groups"):
-                continue
-            if lower.startswith("read the quote") or lower.startswith("discuss"):
-                continue
-            in_passage = True
+        passage_lines.append(line)
 
-        if in_passage:
-            passage_lines.append(line)
-
-    passage = "\n".join(passage_lines).strip()
-    return passage
+    return _join_paragraphs(passage_lines)
 
 
 def _extract_numbered_questions(lines, start_idx, max_questions=10):
-    """Extract numbered questions (1. xxx, 2. xxx, ...) starting from start_idx."""
+    """Extract numbered questions starting from start_idx.
+    Returns clean, validated questions only."""
     questions = []
     current_q = ""
     for i in range(start_idx, min(start_idx + 100, len(lines))):
         line = lines[i].strip()
         if not line:
+            if current_q:
+                # End of multi-line question
+                if _is_valid_question(current_q):
+                    questions.append(_clean_question_text(current_q))
+                current_q = ""
             continue
-        # Check for section breaks
         if _is_section_break(line):
             break
-        # Check if this is a new numbered question
         match = re.match(r'^(\d+)[\.\)]*\s+(.+)', line)
         if match:
-            if current_q:
-                questions.append(current_q.strip())
+            if current_q and _is_valid_question(current_q):
+                questions.append(_clean_question_text(current_q))
             current_q = match.group(2)
         elif line.startswith("........") or line.startswith("……"):
-            # Answer line, skip
-            if current_q:
-                questions.append(current_q.strip())
-                current_q = ""
+            if current_q and _is_valid_question(current_q):
+                questions.append(_clean_question_text(current_q))
+            current_q = ""
         elif re.match(r'^[a-d]$', line.lower()):
-            # Exercise sub-label, stop
-            if current_q:
-                questions.append(current_q.strip())
+            if current_q and _is_valid_question(current_q):
+                questions.append(_clean_question_text(current_q))
             break
         elif current_q:
-            # Continuation of current question
             current_q += " " + line
 
         if len(questions) >= max_questions:
             break
 
-    if current_q and len(questions) < max_questions:
-        questions.append(current_q.strip())
+    if current_q and len(questions) < max_questions and _is_valid_question(current_q):
+        questions.append(_clean_question_text(current_q))
 
     return questions
 
 
 def _extract_comprehension_questions(lines):
-    """Extract comprehension questions from text."""
+    """Extract comprehension questions."""
     cleaned = _clean_lines(lines)
     questions = []
 
@@ -147,49 +220,82 @@ def _extract_comprehension_questions(lines):
 
 
 def _extract_vocabulary_matching(lines):
-    """Extract vocabulary matching exercises (words and their definitions)."""
+    """Extract vocabulary matching exercises as word-definition pairs."""
     cleaned = _clean_lines(lines)
-    items = []
+    words = []
+    definitions = []
 
+    # Find words list (numbered: 1. word, 2. word, ...)
+    match_start = None
     for i, line in enumerate(cleaned):
         lower = line.lower()
         if ("match" in lower and ("word" in lower or "meaning" in lower)):
-            # Extract word list
-            for j in range(i + 1, min(i + 30, len(cleaned))):
-                match = re.match(r'^(\d+)\.\s+(.+)', cleaned[j])
-                if match:
-                    items.append(match.group(2))
-                elif cleaned[j].strip().startswith("a."):
-                    break
-                elif len(items) >= 8:
-                    break
-            if items:
-                break
+            match_start = i
+            break
 
-    # Also look for definitions list (a. xxx, b. xxx)
-    definitions = []
-    for i, line in enumerate(cleaned):
-        match = re.match(r'^([a-h])\.\s+(.+)', line)
-        if match and len(definitions) < len(items) + 2:
-            definitions.append(match.group(2))
+    if match_start is None:
+        return []
 
-    return [{"word": w, "definitions": definitions} for w in items] if items else []
+    # Extract words
+    for j in range(match_start + 1, min(match_start + 20, len(cleaned))):
+        m = re.match(r'^(\d+)[\.\)]*\s+(.+)', cleaned[j])
+        if m:
+            words.append(m.group(2).strip())
+        elif cleaned[j].strip().startswith("a.") or cleaned[j].strip().startswith("a "):
+            break
+        elif len(words) >= 8:
+            break
+
+    # Extract definitions (a. xxx, b. xxx, ...)
+    for j in range(match_start, min(match_start + 40, len(cleaned))):
+        m = re.match(r'^([a-h])[\.\)]\s+(.+)', cleaned[j])
+        if m:
+            # May span multiple lines
+            def_text = m.group(2)
+            # Check next line for continuation
+            if j + 1 < len(cleaned):
+                next_line = cleaned[j + 1].strip()
+                if next_line and not re.match(r'^[a-h][\.\)]', next_line) and \
+                   not re.match(r'^\d+[\.\)]', next_line) and \
+                   not _is_section_break(next_line):
+                    def_text += " " + next_line
+            definitions.append(def_text.strip())
+
+    # Create pairs
+    pairs = []
+    for idx, word in enumerate(words):
+        if idx < len(definitions):
+            pairs.append({"word": word, "definition": definitions[idx]})
+        else:
+            pairs.append({"word": word, "definition": ""})
+
+    return pairs
 
 
 def _extract_word_meaning_questions(lines):
-    """Extract 'find words in the text which mean' or vocabulary definition matching."""
+    """Extract 'guess the meaning' or 'find words that mean' exercises."""
     cleaned = _clean_lines(lines)
     items = []
 
-    # Pattern 1: "In pairs, try to guess the meaning of the highlighted words"
     for i, line in enumerate(cleaned):
         lower = line.lower()
         if ("guess the meaning" in lower or "find words" in lower or
-            "match them with their definitions" in lower):
+            "match them with their definitions" in lower or
+            "choose the right meaning" in lower):
             for j in range(i + 1, min(i + 30, len(cleaned))):
-                match = re.match(r'^(\d+)\s+(.+)', cleaned[j])
-                if match:
-                    items.append(match.group(2))
+                m = re.match(r'^(\d+)\s+(.+)', cleaned[j])
+                if m:
+                    text = m.group(2).strip()
+                    # Check for continuation on next line
+                    if j + 1 < len(cleaned):
+                        next_line = cleaned[j + 1].strip()
+                        if next_line and not re.match(r'^\d+\s', next_line) and \
+                           not re.match(r'^[a-h][\.\)]', next_line) and \
+                           not _is_section_break(next_line) and \
+                           not next_line.startswith("……"):
+                            text += " " + next_line
+                    if len(text) > 5:
+                        items.append(text)
                 elif len(items) >= 8:
                     break
             if items:
@@ -199,7 +305,8 @@ def _extract_word_meaning_questions(lines):
 
 
 def _extract_choose_correct(lines):
-    """Extract multiple choice / choose the correct word exercises."""
+    """Extract 'choose the correct word' exercises.
+    These are sentences with (option1/option2) bracketed choices."""
     cleaned = _clean_lines(lines)
     questions = []
 
@@ -207,13 +314,37 @@ def _extract_choose_correct(lines):
         lower = line.lower()
         if "choose the correct" in lower or "choose the appropriate" in lower or \
            "choose the best" in lower:
-            questions.extend(_extract_numbered_questions(cleaned, i + 1, max_questions=8))
+            for j in range(i + 1, min(i + 60, len(cleaned))):
+                text = cleaned[j]
+                if _is_section_break(text):
+                    break
+                if re.match(r'^[a-d]$', text.lower()):
+                    break
+
+                # Match numbered questions with bracketed options
+                m = re.match(r'^(\d+)[\.\)]*\s+(.+)', text)
+                if m:
+                    q_text = m.group(2)
+                    # Check continuation on next line
+                    k = j + 1
+                    while k < min(j + 3, len(cleaned)):
+                        next_line = cleaned[k].strip()
+                        if not next_line or re.match(r'^\d+[\.\)]*\s', next_line) or \
+                           _is_section_break(next_line) or re.match(r'^[a-d]$', next_line.lower()):
+                            break
+                        q_text += " " + next_line
+                        k += 1
+
+                    q_text = _clean_question_text(q_text)
+                    # Must contain bracketed options like (word1/word2) or (word1, word2)
+                    if re.search(r'\([^)]+[/,][^)]+\)', q_text) and len(q_text) > 15:
+                        questions.append(q_text)
 
     return questions
 
 
 def _extract_rewrite_sentences(lines):
-    """Extract rewrite/correction exercises."""
+    """Extract rewrite/correction exercises — only complete sentences."""
     cleaned = _clean_lines(lines)
     sentences = []
 
@@ -221,7 +352,10 @@ def _extract_rewrite_sentences(lines):
         lower = line.lower()
         if "rewrite" in lower and ("correct" in lower or "sentence" in lower or "following" in lower):
             found = _extract_numbered_questions(cleaned, i + 1, max_questions=6)
-            sentences.extend(found)
+            # Filter: only keep complete sentences without blanks
+            for s in found:
+                if '……' not in s and '........' not in s and _is_valid_question(s):
+                    sentences.append(s)
 
     return sentences
 
@@ -241,7 +375,7 @@ def _extract_complete_sentences(lines):
 
 
 def _extract_grammar_exercises(lines):
-    """Extract grammar exercises (passive voice, tenses, etc.)."""
+    """Extract grammar exercises — only complete sentence transformation tasks."""
     cleaned = _clean_lines(lines)
     exercises = []
 
@@ -262,9 +396,13 @@ def _extract_grammar_exercises(lines):
            ("complete" in lower and ("verb" in lower or "correct form" in lower or
                                       "tense" in lower or "bracket" in lower)) or \
            ("correct" in lower and "form" in lower):
-            exercises.extend(_extract_numbered_questions(cleaned, i + 1, max_questions=6))
+            found = _extract_numbered_questions(cleaned, i + 1, max_questions=6)
+            # Only keep well-formed sentences (no blanks/fill-ins)
+            for s in found:
+                clean = _clean_question_text(s)
+                if not re.search(r'[.…]{4,}', s) and not re.search(r'[.…]{4,}', clean) and len(clean) > 20:
+                    exercises.append(clean)
 
-        # Stop at next major section
         if i > grammar_start + 5 and _is_section_break(cleaned[i]):
             break
 
@@ -272,16 +410,40 @@ def _extract_grammar_exercises(lines):
 
 
 def _extract_true_false(lines):
-    """Extract True/False questions."""
+    """Extract True/False questions from the Reading section only.
+    Skip T/F from Listening sections as they reference different content."""
     cleaned = _clean_lines(lines)
     statements = []
 
+    # Only look for T/F that appears in the Reading section (before Vocabulary/Grammar)
+    in_reading = False
+    past_reading = False
     for i, line in enumerate(cleaned):
-        if "true" in line.lower() and "false" in line.lower():
+        lower = line.strip().lower()
+        if lower == "reading":
+            in_reading = True
+            continue
+        if in_reading and lower in ("vocabulary", "grammar", "listening",
+                                     "speaking", "pronunciation", "everyday english"):
+            past_reading = True
+            in_reading = False
+
+        # Skip T/F from listening section
+        if past_reading:
+            break
+
+        if in_reading and "true" in line.lower() and "false" in line.lower():
+            # Skip if preceded by "Listen" instruction
+            context_before = " ".join(cleaned[max(0, i-3):i]).lower()
+            if "listen" in context_before:
+                continue
+
             for j in range(i + 1, min(i + 20, len(cleaned))):
-                match = re.match(r'^(\d+)\.\s+(.+)', cleaned[j])
-                if match:
-                    statements.append(match.group(2))
+                m = re.match(r'^(\d+)[\.\)]*\s+(.+)', cleaned[j])
+                if m:
+                    text = _clean_question_text(m.group(2))
+                    if _is_valid_question(text):
+                        statements.append(text)
                 elif len(statements) >= 6:
                     break
             if statements:
@@ -291,26 +453,20 @@ def _extract_true_false(lines):
 
 
 def _extract_writing_prompts(lines):
-    """Extract writing/composition prompts."""
+    """Extract writing/composition prompts with guiding questions."""
     cleaned = _clean_lines(lines)
     prompts = []
 
-    writing_section = False
     for i, line in enumerate(cleaned):
         lower = line.lower()
 
-        if line.strip().lower() == "writing":
-            writing_section = True
-            continue
-
-        if writing_section and _is_section_break(line) and line.strip().lower() != "writing":
-            break
-
         if ("write" in lower and ("composition" in lower or "essay" in lower or
                                    "article" in lower)) or \
-           ("write" in lower and "words" in lower and "no" in lower):
+           ("write" in lower and "words" in lower and ("no" in lower or "less" in lower)):
             prompt_text = line.strip()
-            for j in range(i + 1, min(i + 10, len(cleaned))):
+            guiding_questions = []
+
+            for j in range(i + 1, min(i + 20, len(cleaned))):
                 next_line = cleaned[j].strip()
                 if next_line.startswith("........") or next_line.startswith("……"):
                     break
@@ -318,17 +474,23 @@ def _extract_writing_prompts(lines):
                     break
                 if re.match(r'^[a-c]$', next_line):
                     break
-                if next_line.startswith("The answer"):
+                # Check for guiding questions (numbered)
+                gq = re.match(r'^(\d+)[\.\)]*\s+(.+)', next_line)
+                if gq:
+                    guiding_questions.append(gq.group(2).strip())
+                elif next_line and not next_line.startswith("•"):
                     prompt_text += " " + next_line
-                    break
-                prompt_text += " " + next_line
-            prompts.append(prompt_text.strip())
+
+            prompts.append({
+                "prompt": _clean_question_text(prompt_text),
+                "guiding_questions": guiding_questions,
+            })
 
     return prompts
 
 
 def _extract_idioms_exercises(lines):
-    """Extract idiom/phrasal verb fill-in exercises."""
+    """Extract idiom/phrasal verb exercises — only clean sentences."""
     cleaned = _clean_lines(lines)
     exercises = []
 
@@ -336,63 +498,57 @@ def _extract_idioms_exercises(lines):
         lower = line.lower()
         if ("idiom" in lower or "phrasal verb" in lower) and \
            ("fill" in lower or "use" in lower or "replace" in lower or "correct form" in lower):
-            exercises.extend(_extract_numbered_questions(cleaned, i + 1, max_questions=6))
+            found = _extract_numbered_questions(cleaned, i + 1, max_questions=6)
+            for s in found:
+                clean = _clean_question_text(s)
+                # Only keep sentences without fill-in blanks
+                if _is_valid_question(s) and not re.search(r'[.…]{4,}', s):
+                    exercises.append(clean)
 
     return exercises
 
 
-def build_question_bank(unit_num):
-    """Build a complete question bank for a given unit.
+def _deduplicate(items):
+    """Remove duplicate items from a list, preserving order."""
+    seen = set()
+    result = []
+    for item in items:
+        key = item.lower().strip() if isinstance(item, str) else str(item)
+        if key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
 
-    Returns a dict with question categories as keys and lists of questions as values.
+
+def build_question_bank_for_source(unit_num, source="textbook"):
+    """Build a question bank for a given unit from a specific source.
+
+    Args:
+        unit_num: Unit number (1-12)
+        source: "textbook" or "activity"
+
+    Returns:
+        Dict with question categories as keys and lists of questions as values.
     """
-    textbook_lines = get_textbook_unit(unit_num)
-    activity_lines = get_activity_unit(unit_num)
-
-    # Get reading passages from both sources
-    tb_passage = _extract_reading_passage(textbook_lines)
-    act_passage = _extract_reading_passage(activity_lines)
+    if source == "textbook":
+        lines = get_textbook_unit(unit_num)
+    else:
+        lines = get_activity_unit(unit_num)
 
     bank = {
-        "reading_passage": tb_passage,
-        "reading_passage_activity": act_passage,
-        "comprehension": (
-            _extract_comprehension_questions(textbook_lines) +
-            _extract_comprehension_questions(activity_lines)
-        ),
-        "vocabulary": _extract_vocabulary_matching(textbook_lines) +
-                       _extract_vocabulary_matching(activity_lines),
-        "word_meanings": _extract_word_meaning_questions(textbook_lines) +
-                          _extract_word_meaning_questions(activity_lines),
-        "choose_correct": (
-            _extract_choose_correct(textbook_lines) +
-            _extract_choose_correct(activity_lines)
-        ),
-        "rewrite": (
-            _extract_rewrite_sentences(textbook_lines) +
-            _extract_rewrite_sentences(activity_lines)
-        ),
-        "complete_sentences": (
-            _extract_complete_sentences(textbook_lines) +
-            _extract_complete_sentences(activity_lines)
-        ),
-        "grammar": (
-            _extract_grammar_exercises(textbook_lines) +
-            _extract_grammar_exercises(activity_lines)
-        ),
-        "true_false": (
-            _extract_true_false(textbook_lines) +
-            _extract_true_false(activity_lines)
-        ),
-        "writing_prompts": (
-            _extract_writing_prompts(textbook_lines) +
-            _extract_writing_prompts(activity_lines)
-        ),
-        "idioms": (
-            _extract_idioms_exercises(textbook_lines) +
-            _extract_idioms_exercises(activity_lines)
-        ),
+        "reading_passage": _extract_reading_passage(lines),
+        "comprehension": _deduplicate(_extract_comprehension_questions(lines)),
+        "vocabulary": _extract_vocabulary_matching(lines),
+        "word_meanings": _extract_word_meaning_questions(lines),
+        "choose_correct": _deduplicate(_extract_choose_correct(lines)),
+        "rewrite": _deduplicate(_extract_rewrite_sentences(lines)),
+        "complete_sentences": _deduplicate(_extract_complete_sentences(lines)),
+        "grammar": _deduplicate(_extract_grammar_exercises(lines)),
+        "true_false": _deduplicate(_extract_true_false(lines)),
+        "writing_prompts": _extract_writing_prompts(lines),
+        "idioms": _deduplicate(_extract_idioms_exercises(lines)),
         "unit_info": UNITS[unit_num],
+        "source": source,
     }
 
     return bank
