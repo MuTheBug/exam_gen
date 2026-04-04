@@ -109,7 +109,10 @@ def _extract_reading_passage(lines):
         if lower.startswith("before you read") or lower.startswith("match the words") or \
            lower.startswith("match these words") or lower.startswith("in pairs") or \
            lower.startswith("in small groups") or lower.startswith("read the quote") or \
-           lower.startswith("discuss"):
+           lower.startswith("discuss") or lower.startswith("check the words") or \
+           lower.startswith("did you know") or lower.startswith("look at the") or \
+           lower.startswith("work with") or lower.startswith("use your dictionary") or \
+           lower.startswith("read the text") or lower.startswith("answer the following"):
             skip_zone = True
             found_blank_after_skip = False
             continue
@@ -118,16 +121,27 @@ def _extract_reading_passage(lines):
             if skip_zone:
                 found_blank_after_skip = True
             continue
-        # In skip zone, keep skipping numbered items, lettered defs, and short lines
+        # Skip bullet points and very short decorative lines
+        if line.strip() in ('•', '·', '-', '–', '—') or re.match(r'^[•·\-–—]+$', line.strip()):
+            if not skip_zone:
+                skip_zone = True
+                found_blank_after_skip = False
+            continue
+        # In skip zone, keep skipping numbered items, lettered defs, fill-in lines
         if skip_zone:
             if re.match(r'^\d+[\.\)]\s+', line) or re.match(r'^[a-h][\.\)]\s+', line):
+                found_blank_after_skip = False
+                continue
+            # Skip fill-in-the-blank lines
+            if re.search(r'[.…·]{4,}', line):
                 found_blank_after_skip = False
                 continue
             # Short continuation lines of definitions (< 50 chars, no capital start after blank)
             if not found_blank_after_skip and len(line) < 50:
                 continue
-            # After a blank line + a substantial line = likely the passage title or start
-            if found_blank_after_skip and len(line) > 10:
+            # After a blank line + a long line = likely the passage start
+            # Use 40+ chars to skip short sidebar/box content
+            if found_blank_after_skip and len(line) > 40:
                 passage_start = i
                 skip_zone = False
                 break
@@ -155,6 +169,10 @@ def _extract_reading_passage(lines):
             lower.startswith("match the words") or
             lower.startswith("find words")):
             break
+
+        # Skip stray bullet points and single-char decorative lines
+        if line.strip() in ('•', '·', '-', '–', '—') or re.match(r'^[•·\-–—]+$', line.strip()):
+            continue
 
         passage_lines.append(line)
 
