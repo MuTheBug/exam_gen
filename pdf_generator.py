@@ -127,13 +127,28 @@ def _draw_header(canvas, doc, exam_info):
     canvas.restoreState()
 
 
-def _build_exam_story(exam, styles):
-    """Build the reportlab story for one exam in two-column flowing layout."""
+def _build_exam_story(exam, styles, page_split=True):
+    """Build the reportlab story for one exam in two-column flowing layout.
+
+    If page_split is True, insert a PageBreak after the reading passage and
+    its comprehension/vocabulary questions, so grammar and other sections
+    start on a fresh page.
+    """
     story = []
 
-    for section in exam['sections']:
+    # Determine which sections are "reading-related" (passage + first few Q sections)
+    # vs "other" sections (grammar, MCQ, composition, etc.)
+    READING_TYPES = {'passage', 'questions', 'vocabulary', 'true_false'}
+    reading_done = False  # Track when we've passed all reading-related sections
+
+    for sec_idx, section in enumerate(exam['sections']):
         num = section.get('num')
         marks = section.get('marks')
+
+        # Insert page break when transitioning from reading sections to other sections
+        if page_split and not reading_done and section['type'] not in READING_TYPES and sec_idx > 0:
+            reading_done = True
+            story.append(PageBreak())
 
         if section['type'] == 'passage':
             story.append(Paragraph(
@@ -381,6 +396,73 @@ def generate_combined_pdf(textbook_exam, activity_exam, teacher_name="", exam_ye
         styles['source_label']
     ))
     story.extend(_build_exam_story(activity_exam, styles))
+
+    doc.build(story)
+    result = buffer.getvalue()
+    buffer.close()
+    return result
+
+
+def generate_multi_exam_pdf(exams, teacher_name="", exam_year="2025-2026"):
+    """Generate a single PDF containing multiple exams from different units/books.
+
+    Args:
+        exams: List of exam dicts (from build_exam or build_mixed_exam)
+        teacher_name: Teacher name for header
+        exam_year: Academic year for header
+
+    Returns:
+        PDF bytes
+    """
+    if not exams:
+        return b""
+    if len(exams) == 1:
+        return generate_exam_pdf(exams[0], teacher_name=teacher_name, exam_year=exam_year)
+
+    buffer = io.BytesIO()
+
+    infos = []
+    templates = []
+    for i, exam in enumerate(exams):
+        info = {
+            'unit_num': exam['unit_num'],
+            'unit_name': exam['unit_name'],
+            'exam_year': exam_year,
+            'teacher_name': teacher_name,
+            'total_marks': exam['total_marks'],
+            'source_label': exam.get('source_label', ''),
+        }
+        infos.append(info)
+        tmpl = _make_two_col_template(info)
+        tmpl.id = f'exam_{i}'
+        templates.append(tmpl)
+
+    doc = BaseDocTemplate(
+        buffer,
+        pagesize=A4,
+        topMargin=MARGIN_TOP + HEADER_HEIGHT,
+        bottomMargin=MARGIN_BOTTOM,
+        leftMargin=MARGIN_LEFT,
+        rightMargin=MARGIN_RIGHT,
+    )
+    doc.addPageTemplates(templates)
+
+    styles = _styles()
+    story = []
+
+    from reportlab.platypus.doctemplate import NextPageTemplate
+
+    for i, exam in enumerate(exams):
+        if i > 0:
+            story.append(NextPageTemplate(f'exam_{i}'))
+            story.append(PageBreak())
+
+        label = f"Exam {chr(65 + i)} - {exam.get('source_label', '')} (Unit {exam['unit_num']})"
+        story.append(Paragraph(
+            f"<b>{_esc(label)}</b>",
+            styles['source_label']
+        ))
+        story.extend(_build_exam_story(exam, styles, page_split=True))
 
     doc.build(story)
     result = buffer.getvalue()

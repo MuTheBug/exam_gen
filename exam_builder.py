@@ -257,3 +257,27 @@ def build_combined_exams(unit_num, seed=None, **kwargs):
     activity_exam = build_exam(unit_num, source="activity", seed=act_seed, **kwargs)
 
     return textbook_exam, activity_exam
+
+
+def build_mixed_exam(selections, seed=None, **kwargs):
+    """Build a list of exams from arbitrary unit/source combinations.
+
+    Args:
+        selections: List of dicts, each with 'unit' (int) and 'source' ("textbook"/"activity")
+        seed: Random seed
+        **kwargs: Passed to build_exam (num_comprehension, etc.)
+
+    Returns:
+        List of exam dicts, one per selection
+    """
+    base_seed = seed if seed is not None else random.randint(0, 100000)
+    exams = []
+    for i, sel in enumerate(selections):
+        exam = build_exam(
+            sel['unit'],
+            source=sel['source'],
+            seed=base_seed + i,
+            **kwargs,
+        )
+        exams.append(exam)
+    return exams
