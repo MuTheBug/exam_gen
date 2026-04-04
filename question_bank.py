@@ -306,38 +306,39 @@ def _extract_word_meaning_questions(lines):
 
 def _extract_choose_correct(lines):
     """Extract 'choose the correct word' exercises.
-    These are sentences with (option1/option2) bracketed choices."""
+    Accepts both (option1/option2) bracket format and a) b) c) d) format."""
     cleaned = _clean_lines(lines)
     questions = []
 
     for i, line in enumerate(cleaned):
         lower = line.lower()
         if "choose the correct" in lower or "choose the appropriate" in lower or \
-           "choose the best" in lower:
-            for j in range(i + 1, min(i + 60, len(cleaned))):
+           "choose the best" in lower or "circle the correct" in lower or \
+           "select the correct" in lower:
+            for j in range(i + 1, min(i + 80, len(cleaned))):
                 text = cleaned[j]
                 if _is_section_break(text):
                     break
-                if re.match(r'^[a-d]$', text.lower()):
-                    break
 
-                # Match numbered questions with bracketed options
+                # Match numbered questions
                 m = re.match(r'^(\d+)[\.\)]*\s+(.+)', text)
                 if m:
                     q_text = m.group(2)
-                    # Check continuation on next line
+                    # Check continuation on next lines
                     k = j + 1
-                    while k < min(j + 3, len(cleaned)):
+                    while k < min(j + 5, len(cleaned)):
                         next_line = cleaned[k].strip()
                         if not next_line or re.match(r'^\d+[\.\)]*\s', next_line) or \
-                           _is_section_break(next_line) or re.match(r'^[a-d]$', next_line.lower()):
+                           _is_section_break(next_line):
                             break
                         q_text += " " + next_line
                         k += 1
 
                     q_text = _clean_question_text(q_text)
-                    # Must contain bracketed options like (word1/word2) or (word1, word2)
-                    if re.search(r'\([^)]+[/,][^)]+\)', q_text) and len(q_text) > 15:
+                    # Accept bracketed options (word1/word2) OR a)/b)/c)/d) format
+                    has_bracket = re.search(r'\([^)]+[/,][^)]+\)', q_text)
+                    has_abcd = re.search(r'[ab]\)', q_text) and re.search(r'[cd]\)', q_text)
+                    if (has_bracket or has_abcd) and len(q_text) > 15:
                         questions.append(q_text)
 
     return questions
@@ -350,8 +351,12 @@ def _extract_rewrite_sentences(lines):
 
     for i, line in enumerate(cleaned):
         lower = line.lower()
-        if "rewrite" in lower and ("correct" in lower or "sentence" in lower or "following" in lower):
-            found = _extract_numbered_questions(cleaned, i + 1, max_questions=6)
+        if ("rewrite" in lower and ("correct" in lower or "sentence" in lower or "following" in lower)) or \
+           ("correct the following" in lower) or \
+           ("fix the mistake" in lower) or \
+           ("correct the error" in lower) or \
+           ("correct the underlined" in lower):
+            found = _extract_numbered_questions(cleaned, i + 1, max_questions=8)
             # Filter: only keep complete sentences without blanks
             for s in found:
                 if '……' not in s and '........' not in s and _is_valid_question(s):
@@ -375,7 +380,7 @@ def _extract_complete_sentences(lines):
 
 
 def _extract_grammar_exercises(lines):
-    """Extract grammar exercises — only complete sentence transformation tasks."""
+    """Extract grammar exercises — complete sentence transformation tasks."""
     cleaned = _clean_lines(lines)
     exercises = []
 
@@ -388,63 +393,60 @@ def _extract_grammar_exercises(lines):
     if grammar_start is None:
         return exercises
 
-    for i in range(grammar_start, min(grammar_start + 200, len(cleaned))):
-        lower = cleaned[i].lower()
-        if ("change" in lower and ("passive" in lower or "active" in lower)) or \
-           ("rewrite" in lower and i > grammar_start) or \
-           ("put the verb" in lower) or \
-           ("complete" in lower and ("verb" in lower or "correct form" in lower or
-                                      "tense" in lower or "bracket" in lower)) or \
-           ("correct" in lower and "form" in lower):
-            found = _extract_numbered_questions(cleaned, i + 1, max_questions=6)
-            # Only keep well-formed sentences (no blanks/fill-ins)
-            for s in found:
-                clean = _clean_question_text(s)
-                if not re.search(r'[.…]{4,}', s) and not re.search(r'[.…]{4,}', clean) and len(clean) > 20:
-                    exercises.append(clean)
+    # Also look for grammar exercises outside the Grammar section
+    search_ranges = [(grammar_start, min(grammar_start + 200, len(cleaned)))]
 
-        if i > grammar_start + 5 and _is_section_break(cleaned[i]):
-            break
+    for start, end in search_ranges:
+        for i in range(start, end):
+            lower = cleaned[i].lower()
+            if ("change" in lower and ("passive" in lower or "active" in lower)) or \
+               ("rewrite" in lower and i > start) or \
+               ("put the verb" in lower) or \
+               ("do as required" in lower) or \
+               ("join the sentences" in lower) or \
+               ("combine" in lower and "sentence" in lower) or \
+               ("report" in lower and ("sentence" in lower or "following" in lower)) or \
+               ("change" in lower and ("direct" in lower or "indirect" in lower or "reported" in lower)) or \
+               ("complete" in lower and ("verb" in lower or "correct form" in lower or
+                                          "tense" in lower or "bracket" in lower)) or \
+               ("correct" in lower and "form" in lower):
+                found = _extract_numbered_questions(cleaned, i + 1, max_questions=8)
+                for s in found:
+                    clean = _clean_question_text(s)
+                    if not re.search(r'[.…]{4,}', s) and not re.search(r'[.…]{4,}', clean) and len(clean) > 20:
+                        exercises.append(clean)
+
+            if i > start + 5 and _is_section_break(cleaned[i]) and cleaned[i].strip().lower() != "grammar":
+                break
 
     return exercises
 
 
 def _extract_true_false(lines):
-    """Extract True/False questions from the Reading section only.
-    Skip T/F from Listening sections as they reference different content."""
+    """Extract True/False questions. Prefer Reading section, skip Listening."""
     cleaned = _clean_lines(lines)
     statements = []
 
-    # Only look for T/F that appears in the Reading section (before Vocabulary/Grammar)
-    in_reading = False
-    past_reading = False
     for i, line in enumerate(cleaned):
-        lower = line.strip().lower()
-        if lower == "reading":
-            in_reading = True
-            continue
-        if in_reading and lower in ("vocabulary", "grammar", "listening",
-                                     "speaking", "pronunciation", "everyday english"):
-            past_reading = True
-            in_reading = False
-
-        # Skip T/F from listening section
-        if past_reading:
-            break
-
-        if in_reading and "true" in line.lower() and "false" in line.lower():
+        lower = line.lower()
+        if "true" in lower and "false" in lower:
             # Skip if preceded by "Listen" instruction
             context_before = " ".join(cleaned[max(0, i-3):i]).lower()
             if "listen" in context_before:
                 continue
 
-            for j in range(i + 1, min(i + 20, len(cleaned))):
+            for j in range(i + 1, min(i + 25, len(cleaned))):
                 m = re.match(r'^(\d+)[\.\)]*\s+(.+)', cleaned[j])
                 if m:
                     text = _clean_question_text(m.group(2))
                     if _is_valid_question(text):
                         statements.append(text)
-                elif len(statements) >= 6:
+                elif cleaned[j].strip() == '' and len(statements) > 0:
+                    # Allow blank lines between items
+                    continue
+                elif _is_section_break(cleaned[j]):
+                    break
+                elif len(statements) >= 8:
                     break
             if statements:
                 break

@@ -131,26 +131,21 @@ def _build_exam_story(exam, styles):
     """Build the reportlab story for one exam in two-column flowing layout."""
     story = []
 
-    # Build all content that will flow through two columns
     for section in exam['sections']:
         num = section.get('num')
         marks = section.get('marks')
 
         if section['type'] == 'passage':
-            # Instruction line
             story.append(Paragraph(
                 f"<b>{_esc(section['title'])}</b>",
                 styles['instruction']
             ))
-
-            # Reading passage - split into paragraphs
             passage_text = section.get('content', '')
             paragraphs = passage_text.split('\n\n')
             for pidx, para in enumerate(paragraphs):
                 para = para.strip()
                 if not para:
                     continue
-                # First paragraph might be a title (short, no period at end)
                 if pidx == 0 and len(para) < 50 and not para.endswith('.'):
                     story.append(Paragraph(
                         f"<b>{_esc(para)}</b>",
@@ -160,7 +155,6 @@ def _build_exam_story(exam, styles):
                     story.append(Paragraph(_esc(para), styles['passage']))
 
         else:
-            # Section header
             rom = ROMAN[num - 1] if num and num <= len(ROMAN) else str(num or '')
             marks_str = f"  ({marks} marks)" if marks else ""
             story.append(Paragraph(
@@ -176,7 +170,6 @@ def _build_exam_story(exam, styles):
                 else:
                     prompt = str(content)
                     guiding = []
-
                 story.append(Paragraph(_esc(prompt), styles['composition_prompt']))
                 if guiding:
                     story.append(Paragraph(
@@ -187,6 +180,48 @@ def _build_exam_story(exam, styles):
                         story.append(Paragraph(
                             f"{gidx}. {_esc(gq)}",
                             styles['guiding_q']
+                        ))
+
+            elif section['type'] == 'mcq':
+                # MCQ with a) b) c) d) options - format like sample
+                for idx, item in enumerate(section.get('items', []), 1):
+                    if isinstance(item, dict):
+                        stem = item.get('stem', '')
+                        options = item.get('options', [])
+                        # Stem with number
+                        story.append(Paragraph(
+                            f"{idx}. {_esc(stem)}",
+                            styles['question']
+                        ))
+                        if options:
+                            opts_text = "    ".join(_esc(o) for o in options)
+                            story.append(Paragraph(
+                                opts_text,
+                                styles['mcq_options']
+                            ))
+                    else:
+                        story.append(Paragraph(
+                            f"{idx}. {_esc(str(item))}",
+                            styles['question']
+                        ))
+
+            elif section['type'] == 'do_as_required':
+                # Grammar items with individual instructions
+                for idx, item in enumerate(section.get('items', []), 1):
+                    if isinstance(item, dict):
+                        sentence = item.get('sentence', '')
+                        instruction = item.get('instruction', '')
+                        display = f"{_esc(sentence)}"
+                        if instruction:
+                            display += f"    <b>({_esc(instruction)})</b>"
+                        story.append(Paragraph(
+                            f"{idx}. {display}",
+                            styles['question']
+                        ))
+                    else:
+                        story.append(Paragraph(
+                            f"{idx}. {_esc(str(item))}",
+                            styles['question']
                         ))
 
             elif 'items' in section:

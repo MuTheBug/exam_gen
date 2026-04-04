@@ -30,8 +30,10 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Question Counts")
 num_comprehension = st.sidebar.slider("Comprehension questions", 3, 8, 5)
 num_vocabulary = st.sidebar.slider("Vocabulary items", 3, 8, 6)
-num_rewrite = st.sidebar.slider("Rewrite sentences", 2, 6, 3)
-num_choose = st.sidebar.slider("Choose correct", 3, 10, 6)
+num_rewrite = st.sidebar.slider("Rewrite sentences", 2, 6, 4)
+num_choose = st.sidebar.slider("Choose correct (brackets)", 3, 10, 6)
+num_mcq = st.sidebar.slider("MCQ (A/B/C/D)", 4, 12, 8)
+num_true_false = st.sidebar.slider("True/False statements", 3, 8, 5)
 num_complete = st.sidebar.slider("Complete sentences", 2, 6, 4)
 num_grammar = st.sidebar.slider("Grammar exercises", 2, 8, 5)
 
@@ -51,6 +53,8 @@ try:
         num_vocabulary=num_vocabulary,
         num_rewrite=num_rewrite,
         num_choose=num_choose,
+        num_mcq=num_mcq,
+        num_true_false=num_true_false,
         num_complete=num_complete,
         num_grammar=num_grammar,
     )
@@ -59,7 +63,8 @@ except Exception as e:
     st.stop()
 
 # Roman numerals
-ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X']
+ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X',
+         'XI', 'XII', 'XIII', 'XIV', 'XV']
 
 
 def display_exam(exam, label):
@@ -100,6 +105,22 @@ def display_exam(exam, label):
                         st.markdown(f"  - {gq}")
                 else:
                     st.markdown(f"> {content}")
+            elif section['type'] == 'mcq':
+                for idx, item in enumerate(section['items'], 1):
+                    if isinstance(item, dict):
+                        st.markdown(f"  {idx}. {item.get('stem', '')}")
+                        opts = "  |  ".join(item.get('options', []))
+                        st.markdown(f"  &nbsp;&nbsp;&nbsp;&nbsp;{opts}")
+                    else:
+                        st.markdown(f"  {idx}. {item}")
+            elif section['type'] == 'do_as_required':
+                for idx, item in enumerate(section['items'], 1):
+                    if isinstance(item, dict):
+                        sent = item.get('sentence', '')
+                        instr = item.get('instruction', '')
+                        st.markdown(f"  {idx}. {sent}  **({instr})**" if instr else f"  {idx}. {sent}")
+                    else:
+                        st.markdown(f"  {idx}. {item}")
             elif 'items' in section:
                 for idx, item in enumerate(section['items'], 1):
                     if isinstance(item, dict):
