@@ -2,7 +2,9 @@
 
 import streamlit as st
 import random
-from exam_builder import build_exam, build_combined_exams, build_mixed_exam
+from exam_builder import (
+    build_exam, build_combined_exams, build_mixed_exam, build_single_model_exam
+)
 from pdf_generator import generate_combined_pdf, generate_multi_exam_pdf
 from config import UNITS
 
@@ -21,8 +23,13 @@ st.sidebar.header("Exam Settings")
 # Mode selection
 mode = st.sidebar.radio(
     "Exam Mode",
-    ["Single Unit (2 exams)", "Mixed (custom selections)"],
-    help="Single Unit: one exam per book for one unit.\nMixed: pick any combination of units and books.",
+    ["Single Unit (2 exams)", "Single Model (multi-unit)", "Mixed (custom selections)"],
+    help=(
+        "**Single Unit**: one exam per book for one unit.\n\n"
+        "**Single Model**: one combined exam from multiple selected units - "
+        "picks passages randomly and pools questions.\n\n"
+        "**Mixed**: manually pick any combination of units and books."
+    ),
 )
 
 exam_year = st.sidebar.text_input("Academic Year", value="2025-2026")
@@ -30,20 +37,18 @@ teacher_name = st.sidebar.text_input("Teacher Name (optional)", value="")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Question Counts")
-num_comprehension = st.sidebar.slider("Comprehension questions", 3, 8, 5)
-num_vocabulary = st.sidebar.slider("Vocabulary items", 3, 8, 6)
-num_rewrite = st.sidebar.slider("Rewrite sentences", 2, 6, 4)
-num_choose = st.sidebar.slider("Choose correct (brackets)", 3, 10, 6)
-num_mcq = st.sidebar.slider("MCQ (A/B/C/D)", 4, 12, 8)
-num_true_false = st.sidebar.slider("True/False statements", 3, 8, 5)
-num_complete = st.sidebar.slider("Complete sentences", 2, 6, 4)
+num_comprehension = st.sidebar.slider("Comprehension questions", 2, 8, 3)
+num_vocabulary = st.sidebar.slider("Vocabulary items", 2, 8, 5)
+num_rewrite = st.sidebar.slider("Rewrite sentences", 2, 6, 3)
+num_mcq = st.sidebar.slider("MCQ (A/B/C/D)", 3, 12, 6)
+num_true_false = st.sidebar.slider("True/False statements", 2, 8, 4)
+num_complete = st.sidebar.slider("Complete sentences", 2, 6, 3)
 num_grammar = st.sidebar.slider("Grammar exercises", 2, 8, 5)
 
 Q_KWARGS = dict(
     num_comprehension=num_comprehension,
     num_vocabulary=num_vocabulary,
     num_rewrite=num_rewrite,
-    num_choose=num_choose,
     num_mcq=num_mcq,
     num_true_false=num_true_false,
     num_complete=num_complete,
@@ -61,7 +66,8 @@ SOURCE_LABELS = {"textbook": "Student Book", "activity": "Activity Book"}
 def display_exam(exam, label, key_prefix):
     """Display an exam preview in the Streamlit app."""
     st.markdown(f"### {label}")
-    st.markdown(f"**Exam / Unit {exam['unit_num']} - {exam['unit_name']} (Scientific)**")
+    st.markdown(f"**Unit {exam['unit_num']} - {exam['unit_name']}** "
+                f"({exam.get('source_label', '')})")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -78,7 +84,7 @@ def display_exam(exam, label, key_prefix):
             st.text_area(
                 "Reading Passage",
                 value=section['content'],
-                height=250,
+                height=200,
                 disabled=True,
                 label_visibility="collapsed",
                 key=f"{key_prefix}_passage",
@@ -109,7 +115,10 @@ def display_exam(exam, label, key_prefix):
                     if isinstance(item, dict):
                         sent = item.get('sentence', '')
                         instr = item.get('instruction', '')
-                        st.markdown(f"  {idx}. {sent}  **({instr})**" if instr else f"  {idx}. {sent}")
+                        st.markdown(
+                            f"  {idx}. {sent}  **({instr})**" if instr
+                            else f"  {idx}. {sent}"
+                        )
                     else:
                         st.markdown(f"  {idx}. {item}")
             elif 'items' in section:
@@ -141,7 +150,8 @@ if mode == "Single Unit (2 exams)":
 
     try:
         tb_exam, act_exam = build_combined_exams(
-            unit_num, seed=st.session_state["seed"], **Q_KWARGS,
+            unit_num, seed=st.session_state["seed"],
+            num_choose=6, **Q_KWARGS,
         )
     except Exception as e:
         st.error(f"Error generating exam: {e}")
@@ -153,7 +163,6 @@ if mode == "Single Unit (2 exams)":
     with tab2:
         display_exam(act_exam, "Exam B - Activity Book", "single_act")
 
-    # PDF download
     st.sidebar.markdown("---")
     try:
         pdf_bytes = generate_combined_pdf(
@@ -161,9 +170,73 @@ if mode == "Single Unit (2 exams)":
             teacher_name=teacher_name, exam_year=exam_year,
         )
         st.sidebar.download_button(
-            label="Download Combined PDF",
+            label="Download PDF (2 pages)",
             data=pdf_bytes,
-            file_name=f"exam_unit_{unit_num}_{tb_exam['unit_name'].replace(' ', '_')}.pdf",
+            file_name=f"exam_unit_{unit_num}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+    except Exception as e:
+        st.sidebar.error(f"PDF generation error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════
+# Single Model Mode (multi-unit)
+# ══════════════════════════════════════════════════════════════
+elif mode == "Single Model (multi-unit)":
+    st.markdown("### Single Model Exam")
+    st.markdown(
+        "Select multiple units below. The app will randomly pick **two passages** "
+        "from the selected units and pool grammar/MCQ questions from all of them."
+    )
+
+    # Unit checkboxes
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Select Units")
+    selected_units = []
+    for n, info in UNITS.items():
+        if st.sidebar.checkbox(f"Unit {n}: {info['name']}", value=(n <= 4), key=f"sm_u{n}"):
+            selected_units.append(n)
+
+    if not selected_units:
+        st.warning("Please select at least one unit from the sidebar.")
+        st.stop()
+
+    try:
+        exam_a, exam_b = build_single_model_exam(
+            selected_units,
+            seed=st.session_state["seed"],
+            **Q_KWARGS,
+        )
+    except Exception as e:
+        st.error(f"Error generating exam: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        st.stop()
+
+    total_marks = exam_a['total_marks'] + exam_b['total_marks']
+    st.markdown(f"**Selected units:** {', '.join(str(u) for u in selected_units)} | "
+                f"**Total marks:** {total_marks}")
+
+    tab1, tab2 = st.tabs([
+        f"Column A - Unit {exam_a['unit_num']} ({exam_a['source_label']})",
+        f"Column B - Unit {exam_b['unit_num']} ({exam_b['source_label']})",
+    ])
+    with tab1:
+        display_exam(exam_a, f"Column A", "sm_a")
+    with tab2:
+        display_exam(exam_b, f"Column B", "sm_b")
+
+    st.sidebar.markdown("---")
+    try:
+        pdf_bytes = generate_multi_exam_pdf(
+            [exam_a, exam_b],
+            teacher_name=teacher_name, exam_year=exam_year,
+        )
+        st.sidebar.download_button(
+            label="Download PDF (2 pages)",
+            data=pdf_bytes,
+            file_name=f"exam_model_units_{'_'.join(str(u) for u in selected_units)}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
@@ -175,17 +248,15 @@ if mode == "Single Unit (2 exams)":
 # Mixed Mode
 # ══════════════════════════════════════════════════════════════
 else:
-    st.markdown("### Build a Mixed Exam")
-    st.markdown("Select different units and books. Each selection becomes a separate exam section in the PDF.")
+    st.markdown("### Mixed Exam")
+    st.markdown("Pick specific units and books for each exam column.")
 
-    # Initialize selections in session state
     if "mix_selections" not in st.session_state:
         st.session_state["mix_selections"] = [
             {"unit": 1, "source": "textbook"},
             {"unit": 1, "source": "activity"},
         ]
 
-    # Add / remove controls
     col_add, col_remove = st.columns(2)
     with col_add:
         if st.button("+ Add Exam Section"):
@@ -197,7 +268,6 @@ else:
                 st.session_state["mix_selections"].pop()
                 st.rerun()
 
-    # Selection rows
     selections = st.session_state["mix_selections"]
     for i, sel in enumerate(selections):
         c1, c2 = st.columns(2)
@@ -208,7 +278,8 @@ else:
                 index=list(UNIT_LABELS.keys()).index(sel["unit"]),
                 key=f"mix_unit_{i}",
             )
-            selections[i]["unit"] = [n for n, lbl in UNIT_LABELS.items() if lbl == unit_choice][0]
+            selections[i]["unit"] = [n for n, lbl in UNIT_LABELS.items()
+                                     if lbl == unit_choice][0]
         with c2:
             src_choice = st.selectbox(
                 f"Exam {chr(65+i)} - Book",
@@ -220,14 +291,15 @@ else:
 
     st.markdown("---")
 
-    # Build mixed exams
     try:
-        exams = build_mixed_exam(selections, seed=st.session_state["seed"], **Q_KWARGS)
+        exams = build_mixed_exam(
+            selections, seed=st.session_state["seed"],
+            num_choose=6, **Q_KWARGS,
+        )
     except Exception as e:
         st.error(f"Error generating exams: {e}")
         st.stop()
 
-    # Display in tabs
     tab_labels = [
         f"Exam {chr(65+i)} - Unit {sel['unit']} ({SOURCE_LABELS[sel['source']]})"
         for i, sel in enumerate(selections)
@@ -237,7 +309,6 @@ else:
         with tab:
             display_exam(exams[i], tab_labels[i], f"mix_{i}")
 
-    # PDF download
     st.sidebar.markdown("---")
     try:
         pdf_bytes = generate_multi_exam_pdf(
@@ -245,7 +316,7 @@ else:
         )
         units_str = "_".join(f"u{s['unit']}" for s in selections)
         st.sidebar.download_button(
-            label="Download Combined PDF",
+            label="Download PDF (2 pages)",
             data=pdf_bytes,
             file_name=f"exam_mixed_{units_str}.pdf",
             mime="application/pdf",

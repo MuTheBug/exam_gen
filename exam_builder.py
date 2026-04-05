@@ -281,3 +281,250 @@ def build_mixed_exam(selections, seed=None, **kwargs):
         )
         exams.append(exam)
     return exams
+
+
+def build_single_model_exam(unit_nums, seed=None,
+                            num_comprehension=3, num_vocabulary=5,
+                            num_rewrite=3, num_complete=3,
+                            num_mcq=6, num_grammar=5,
+                            num_true_false=4):
+    """Build a single unified exam (two columns A+B) from multiple units.
+
+    Picks two passages from different units/sources. Text-related questions
+    (comprehension, vocabulary, rewrite, complete, true/false) stay with their
+    passage. Non-text questions (MCQ, grammar, composition) are pooled from
+    all selected units.
+
+    Args:
+        unit_nums: List of unit numbers to draw from (e.g. [1, 3, 5, 7])
+        seed: Random seed
+
+    Returns:
+        Tuple of (exam_a, exam_b) where each is an exam dict for one column
+    """
+    if seed is not None:
+        random.seed(seed)
+
+    if not unit_nums:
+        unit_nums = [1]
+
+    # Collect banks from all selected units, both sources
+    all_banks = []
+    for u in unit_nums:
+        for src in ['textbook', 'activity']:
+            bank = build_question_bank_for_source(u, src)
+            curated = _get_curated_bank(u)
+            if bank['reading_passage'] and len(bank['reading_passage']) > 100:
+                all_banks.append({
+                    'unit': u,
+                    'source': src,
+                    'bank': bank,
+                    'curated': curated,
+                    'unit_info': bank['unit_info'],
+                })
+
+    if len(all_banks) < 2:
+        # Fallback: duplicate
+        all_banks = all_banks * 2
+
+    # Pick 2 different passage sources randomly
+    chosen = random.sample(all_banks, min(2, len(all_banks)))
+
+    # Pool non-text questions from ALL selected units
+    all_mcq = []
+    all_grammar_rewrite = []
+    all_grammar_extracted = []
+    all_writing_prompts = []
+
+    for entry in all_banks:
+        bank = entry['bank']
+        curated = entry['curated']
+        all_mcq.extend(curated.get('grammar_mcq', []))
+        all_mcq.extend(curated.get('vocabulary_mcq', []))
+        all_grammar_rewrite.extend(curated.get('grammar_rewrite', []))
+        all_grammar_extracted.extend(bank.get('grammar', []))
+        all_writing_prompts.extend(bank.get('writing_prompts', []))
+
+    # Deduplicate pooled questions
+    all_mcq = _deduplicate_dicts(all_mcq, key='stem')
+    all_grammar_rewrite = _deduplicate_dicts(all_grammar_rewrite, key='sentence')
+    all_grammar_extracted = list({s: s for s in all_grammar_extracted}.values())
+
+    # Split pooled questions between the two exams
+    mcq_a = _sample(all_mcq, num_mcq)
+    remaining_mcq = [q for q in all_mcq if q not in mcq_a]
+    mcq_b = _sample(remaining_mcq, num_mcq)
+
+    grammar_pool = all_grammar_extracted + [
+        g.get('sentence', str(g)) if isinstance(g, dict) else str(g)
+        for g in all_grammar_rewrite
+    ]
+    random.shuffle(grammar_pool)
+    grammar_a = grammar_pool[:num_grammar]
+    grammar_b = grammar_pool[num_grammar:num_grammar * 2]
+
+    # Build each exam column
+    exams = []
+    for idx, entry in enumerate(chosen):
+        bank = entry['bank']
+        curated = entry['curated']
+        unit_info = entry['unit_info']
+
+        reading = bank['reading_passage']
+        source_label = "Student Book" if entry['source'] == 'textbook' else "Activity Book"
+
+        # Text-related questions (from THIS passage's unit only)
+        comprehension = _sample(bank['comprehension'], num_comprehension)
+
+        vocab_items = bank.get('word_meanings', [])
+        if not vocab_items:
+            vocab_items = [item['word'] if isinstance(item, dict) else item
+                           for item in bank.get('vocabulary', [])]
+        vocab_items = _sample(vocab_items, num_vocabulary)
+
+        rewrite_extracted = bank.get('rewrite', [])
+        rewrite_curated = curated.get('rewrite_correct', [])
+        rewrite_pool = _merge_lists(rewrite_extracted, rewrite_curated)
+        rewrite_items = _sample(rewrite_pool, num_rewrite)
+
+        tf_extracted = bank.get('true_false', [])
+        tf_curated = curated.get('true_false', [])
+        tf_pool = _merge_lists(tf_extracted, tf_curated)
+        true_false_items = _sample(tf_pool, num_true_false)
+
+        complete_extracted = bank.get('complete_sentences', [])
+        complete_curated = curated.get('complete_sentences', [])
+        complete_pool = _merge_lists(complete_extracted, complete_curated)
+        complete_items = _sample(complete_pool, num_complete)
+
+        # Use pooled non-text questions
+        my_mcq = mcq_a if idx == 0 else mcq_b
+        my_grammar = grammar_a if idx == 0 else grammar_b
+
+        # Writing prompt
+        if all_writing_prompts:
+            writing_prompt = random.choice(all_writing_prompts)
+        else:
+            writing_prompt = {
+                "prompt": f"Write a composition of no less than 80 words about "
+                          f"{unit_info['name'].lower()}.",
+                "guiding_questions": curated.get('writing_guiding', [])[:5],
+            }
+
+        # Build exam structure
+        exam = {
+            "unit_num": entry['unit'],
+            "unit_name": unit_info['name'],
+            "source": entry['source'],
+            "source_label": source_label,
+            "sections": [],
+        }
+
+        section_counter = [0]
+        def _next():
+            section_counter[0] += 1
+            return section_counter[0]
+
+        # Reading passage
+        if reading:
+            exam["sections"].append({
+                "num": None,
+                "title": "Read the following text then do the tasks below:",
+                "content": reading, "marks": None, "type": "passage",
+            })
+
+        # Comprehension
+        if comprehension:
+            exam["sections"].append({
+                "num": _next(),
+                "title": "Answer the following questions:",
+                "items": comprehension, "marks": len(comprehension) * 4,
+                "type": "questions",
+            })
+
+        # Vocabulary
+        if vocab_items:
+            exam["sections"].append({
+                "num": _next(),
+                "title": "Find words in the text which mean the following:",
+                "items": vocab_items, "marks": len(vocab_items) * 2,
+                "type": "vocabulary",
+            })
+
+        # Rewrite to correct
+        if rewrite_items:
+            exam["sections"].append({
+                "num": _next(),
+                "title": "Rewrite to correct the information:",
+                "items": rewrite_items, "marks": len(rewrite_items) * 3,
+                "type": "questions",
+            })
+
+        # True/False
+        if true_false_items:
+            exam["sections"].append({
+                "num": _next(),
+                "title": "True or False:",
+                "items": true_false_items, "marks": len(true_false_items) * 2,
+                "type": "true_false",
+            })
+
+        # MCQ (pooled)
+        if my_mcq:
+            exam["sections"].append({
+                "num": _next(),
+                "title": "Choose the correct answer A, B, C or D:",
+                "items": my_mcq, "marks": len(my_mcq) * 3,
+                "type": "mcq",
+            })
+
+        # Complete sentences
+        if complete_items:
+            exam["sections"].append({
+                "num": _next(),
+                "title": "Complete from the text:",
+                "items": complete_items, "marks": len(complete_items) * 3,
+                "type": "questions",
+            })
+
+        # Grammar (pooled)
+        if my_grammar:
+            grammar_topic = unit_info.get('grammar', 'Grammar')
+            exam["sections"].append({
+                "num": _next(),
+                "title": f"Do as required ({grammar_topic}):",
+                "items": my_grammar, "marks": len(my_grammar) * 4,
+                "type": "do_as_required",
+            })
+
+        # Composition (only on the second column to save space)
+        if idx == 1:
+            exam["sections"].append({
+                "num": _next(),
+                "title": "Write a composition of no less than 80 words on the "
+                         "following topic:",
+                "content": writing_prompt if isinstance(writing_prompt, dict)
+                           else {"prompt": writing_prompt, "guiding_questions": []},
+                "marks": 20,
+                "type": "composition",
+            })
+
+        exam["total_marks"] = sum(s.get("marks", 0) or 0 for s in exam["sections"])
+        exams.append(exam)
+
+    return exams[0], exams[1]
+
+
+def _deduplicate_dicts(items, key='stem'):
+    """Remove duplicate dicts by a key field, preserving order."""
+    seen = set()
+    result = []
+    for item in items:
+        if isinstance(item, dict):
+            k = item.get(key, '').lower().strip()
+        else:
+            k = str(item).lower().strip()
+        if k and k not in seen:
+            seen.add(k)
+            result.append(item)
+    return result
