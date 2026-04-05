@@ -1,38 +1,53 @@
-"""Generate a formatted exam PDF strictly matching the sample exam layout.
+"""Generate a formatted exam PDF matching the sample layout.
 
-The sample uses a two-column layout:
-- Page 1: Reading passage fills the left column, questions start in the right column
-- Page 2+: Questions flow across both columns
-- Header drawn at the top of every page
-- Footer "The End Of The Questions" at the very end
+Layout: two independent columns on each page.
+- Left column: first passage + its questions
+- Right column: second passage + its questions
+- Arabic+English header in bordered box
+- Dotted answer lines after questions
+- Continuous section/question numbering across columns
 """
 
 import io
+import arabic_reshaper
+from bidi.algorithm import get_display
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 from reportlab.platypus import (
     BaseDocTemplate, Frame, PageTemplate, Paragraph, Spacer,
-    Table, TableStyle, PageBreak, FrameBreak
+    PageBreak,
 )
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib import colors
 
-PAGE_W, PAGE_H = A4
-MARGIN_LEFT = 12 * mm
-MARGIN_RIGHT = 12 * mm
-MARGIN_TOP = 10 * mm
-MARGIN_BOTTOM = 10 * mm
-HEADER_HEIGHT = 18 * mm
-GUTTER = 6 * mm
+# Register DejaVu fonts (Arabic-capable)
+pdfmetrics.registerFont(TTFont('DejaVu', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
+pdfmetrics.registerFont(TTFont('DejaVu-Bold', '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'))
 
-# Column dimensions
+PAGE_W, PAGE_H = A4
+MARGIN_LEFT = 10 * mm
+MARGIN_RIGHT = 10 * mm
+MARGIN_TOP = 8 * mm
+MARGIN_BOTTOM = 8 * mm
+HEADER_HEIGHT = 24 * mm
+GUTTER = 4 * mm
+
 CONTENT_W = PAGE_W - MARGIN_LEFT - MARGIN_RIGHT
 COL_W = (CONTENT_W - GUTTER) / 2
-COL_H = PAGE_H - MARGIN_TOP - MARGIN_BOTTOM - HEADER_HEIGHT
 
 ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X',
          'XI', 'XII', 'XIII', 'XIV', 'XV']
+
+DOTS = '.' * 55
+
+
+def _ar(text):
+    """Reshape Arabic text for correct display."""
+    reshaped = arabic_reshaper.reshape(text)
+    return get_display(reshaped)
 
 
 def _esc(text):
@@ -47,114 +62,144 @@ def _esc(text):
 
 
 def _styles():
-    """Build paragraph styles matching the dense sample exam layout."""
+    """Build paragraph styles matching the sample layout."""
     s = {}
     s['passage_title'] = ParagraphStyle(
-        'passage_title', fontSize=8.5, fontName='Helvetica-Bold',
-        leading=10, spaceBefore=0, spaceAfter=1 * mm,
+        'passage_title', fontSize=9, fontName='Helvetica-Bold',
+        leading=11, spaceBefore=0, spaceAfter=1 * mm,
     )
     s['passage'] = ParagraphStyle(
         'passage', fontSize=8, fontName='Times-Roman',
-        leading=9.5, spaceBefore=0, spaceAfter=0.5 * mm,
+        leading=10, spaceBefore=0, spaceAfter=0.5 * mm,
     )
-    s['section_title'] = ParagraphStyle(
-        'section_title', fontSize=8.5, fontName='Helvetica-Bold',
-        leading=10, spaceBefore=2.5 * mm, spaceAfter=1 * mm,
-    )
-    s['instruction'] = ParagraphStyle(
-        'instruction', fontSize=8.5, fontName='Helvetica-Bold',
-        leading=10, spaceBefore=1 * mm, spaceAfter=1 * mm,
+    s['section_header'] = ParagraphStyle(
+        'section_header', fontSize=8.5, fontName='Helvetica-Bold',
+        leading=10, spaceBefore=2 * mm, spaceAfter=1 * mm,
     )
     s['question'] = ParagraphStyle(
         'question', fontSize=8, fontName='Times-Roman',
-        leading=9.5, spaceBefore=0.3 * mm, spaceAfter=0.3 * mm,
-        leftIndent=3 * mm,
+        leading=10, spaceBefore=0.3 * mm, spaceAfter=0,
     )
-    s['mcq_options'] = ParagraphStyle(
-        'mcq_options', fontSize=7.5, fontName='Times-Roman',
+    s['dots'] = ParagraphStyle(
+        'dots', fontSize=7, fontName='Times-Roman',
+        leading=8, spaceBefore=0, spaceAfter=0.8 * mm,
+        textColor=colors.grey,
+    )
+    s['mcq_stem'] = ParagraphStyle(
+        'mcq_stem', fontSize=8, fontName='Times-Roman',
+        leading=10, spaceBefore=0.3 * mm, spaceAfter=0,
+    )
+    s['mcq_opts'] = ParagraphStyle(
+        'mcq_opts', fontSize=7.5, fontName='Times-Roman',
         leading=9, spaceBefore=0, spaceAfter=0.5 * mm,
-        leftIndent=6 * mm,
+        leftIndent=3 * mm,
     )
     s['composition_prompt'] = ParagraphStyle(
         'composition_prompt', fontSize=8, fontName='Times-Roman',
-        leading=9.5, spaceBefore=0.5 * mm, spaceAfter=0.5 * mm,
-        leftIndent=3 * mm,
+        leading=10, spaceBefore=0.5 * mm, spaceAfter=0.5 * mm,
     )
     s['guiding_q'] = ParagraphStyle(
         'guiding_q', fontSize=7.5, fontName='Times-Roman',
-        leading=9, leftIndent=6 * mm,
+        leading=9, leftIndent=3 * mm,
     )
     s['footer'] = ParagraphStyle(
         'footer', fontSize=9, fontName='Helvetica-Bold',
         leading=11, alignment=TA_CENTER, spaceBefore=3 * mm,
     )
-    s['source_label'] = ParagraphStyle(
-        'source_label', fontSize=9, fontName='Helvetica-Bold',
-        leading=11, alignment=TA_CENTER, spaceBefore=1 * mm, spaceAfter=1 * mm,
-    )
     return s
 
 
-def _draw_header(canvas, doc, exam_info):
-    """Draw the header at the top of each page, matching sample exactly."""
+def _draw_header(canvas, exam_info):
+    """Draw the Arabic+English header box at the top of each page."""
     canvas.saveState()
 
-    y = PAGE_H - MARGIN_TOP
+    y_top = PAGE_H - MARGIN_TOP
     x_left = MARGIN_LEFT
     x_right = PAGE_W - MARGIN_RIGHT
+    box_h = HEADER_HEIGHT
+    y_bottom = y_top - box_h
 
-    # Left: Exam title
-    canvas.setFont('Helvetica-Bold', 9)
-    title = f"Exam Sample/Unit {exam_info['unit_num']} {exam_info['unit_name']}"
-    canvas.drawString(x_left, y - 10, title)
+    # Outer box
+    canvas.setStrokeColor(colors.black)
+    canvas.setLineWidth(0.8)
+    canvas.rect(x_left, y_bottom, x_right - x_left, box_h)
 
-    # Center: Year
-    canvas.setFont('Helvetica', 9)
-    year = exam_info.get('exam_year', '2025-2026')
-    canvas.drawCentredString(PAGE_W / 2, y - 10, year)
+    # Row heights
+    row_h = box_h / 3
+    y_row1 = y_top - row_h
+    y_row2 = y_top - 2 * row_h
 
-    # Right: Teacher name
+    # Horizontal lines between rows
+    canvas.setLineWidth(0.4)
+    canvas.line(x_left, y_row1, x_right, y_row1)
+    canvas.line(x_left, y_row2, x_right, y_row2)
+
+    # Vertical divider in middle
+    x_mid = (x_left + x_right) / 2
+    canvas.line(x_mid, y_top, x_mid, y_bottom)
+
+    text_offset = 2.5 * mm  # vertical offset from bottom of row
+
+    # --- Row 1 ---
+    canvas.setFont('DejaVu-Bold', 9)
+    ar_text = _ar('جميع وحدات الكتاب')
+    canvas.drawRightString(x_mid - 3 * mm, y_row1 + text_offset, ar_text)
+
+    model_num = exam_info.get('model_num', '')
+    en_label = "All Modules"
+    ar_label = _ar(f'النموذج ({model_num})')
+    canvas.drawString(x_mid + 3 * mm, y_row1 + text_offset,
+                      f"{ar_label}     {en_label}")
+
+    # --- Row 2 ---
+    canvas.setFont('DejaVu', 8)
+    ar_name = _ar('الاسم:')
+    canvas.drawRightString(x_mid - 3 * mm, y_row2 + text_offset,
+                           f"{'.' * 30}  {ar_name}")
+
+    ar_date = _ar('التاريخ:')
+    ar_class = _ar('الصف:')
+    canvas.drawString(x_mid + 3 * mm, y_row2 + text_offset,
+                      f"{ar_date} {'.' * 10}   {ar_class} {'.' * 10}")
+
+    # --- Row 3 ---
+    canvas.setFont('DejaVu-Bold', 8)
+    ar_duration = _ar('المدة: ساعتين')
+    canvas.drawRightString(x_mid - 3 * mm, y_bottom + text_offset, ar_duration)
+
+    total = exam_info.get('total_marks', 300)
+    ar_marks = _ar(f'العلامة الكاملة: {total} درجة')
+    canvas.drawString(x_mid + 3 * mm, y_bottom + text_offset, ar_marks)
+
+    # Teacher name (small, top right outside box)
     teacher = exam_info.get('teacher_name', '')
     if teacher:
-        canvas.setFont('Helvetica', 8)
-        canvas.drawRightString(x_right, y - 10, teacher)
-
-    # Horizontal line below header
-    canvas.setStrokeColor(colors.black)
-    canvas.setLineWidth(0.5)
-    canvas.line(x_left, y - 15, x_right, y - 15)
+        canvas.setFont('Helvetica', 7)
+        canvas.drawRightString(x_right, y_top + 2 * mm, teacher)
 
     canvas.restoreState()
 
 
-def _build_exam_story(exam, styles, page_split=True):
-    """Build the reportlab story for one exam in two-column flowing layout.
+def _build_column_flowables(exam, styles, start_sec=1, start_q=1):
+    """Build list of flowables for one column (one exam).
 
-    If page_split is True, insert a PageBreak after the reading passage and
-    its comprehension/vocabulary questions, so grammar and other sections
-    start on a fresh page.
+    Returns: (flowables_list, next_section_num, next_question_num)
     """
     story = []
+    sec_num = start_sec
+    q_num = start_q
 
-    # Determine which sections are "reading-related" (passage + first few Q sections)
-    # vs "other" sections (grammar, MCQ, composition, etc.)
-    READING_TYPES = {'passage', 'questions', 'vocabulary', 'true_false'}
-    reading_done = False  # Track when we've passed all reading-related sections
-
-    for sec_idx, section in enumerate(exam['sections']):
-        num = section.get('num')
+    for section in exam['sections']:
         marks = section.get('marks')
 
-        # Insert page break when transitioning from reading sections to other sections
-        if page_split and not reading_done and section['type'] not in READING_TYPES and sec_idx > 0:
-            reading_done = True
-            story.append(PageBreak())
-
         if section['type'] == 'passage':
+            rom = ROMAN[sec_num - 1] if sec_num <= len(ROMAN) else str(sec_num)
             story.append(Paragraph(
-                f"<b>{_esc(section['title'])}</b>",
-                styles['instruction']
+                f"<b><u>{rom} – {_esc(section['title'])}</u></b>",
+                styles['section_header']
             ))
+            sec_num += 1
+
             passage_text = section.get('content', '')
             paragraphs = passage_text.split('\n\n')
             for pidx, para in enumerate(paragraphs):
@@ -163,308 +208,275 @@ def _build_exam_story(exam, styles, page_split=True):
                     continue
                 if pidx == 0 and len(para) < 50 and not para.endswith('.'):
                     story.append(Paragraph(
-                        f"<b>{_esc(para)}</b>",
-                        styles['passage_title']
+                        f"<b>{_esc(para)}</b>", styles['passage_title']
                     ))
                 else:
                     story.append(Paragraph(_esc(para), styles['passage']))
 
-        else:
-            rom = ROMAN[num - 1] if num and num <= len(ROMAN) else str(num or '')
+        elif section['type'] == 'composition':
             marks_str = f"  ({marks} marks)" if marks else ""
             story.append(Paragraph(
-                f"<b>{rom}- {_esc(section['title'])}{marks_str}</b>",
-                styles['section_title']
+                f"<b><u>- {_esc(section['title'])}</u></b>{marks_str}",
+                styles['section_header']
             ))
+            content = section.get('content', {})
+            if isinstance(content, dict):
+                prompt = content.get('prompt', '')
+                guiding = content.get('guiding_questions', [])
+            else:
+                prompt = str(content)
+                guiding = []
+            story.append(Paragraph(_esc(prompt), styles['composition_prompt']))
+            if guiding:
+                story.append(Paragraph(
+                    "The answers of these questions can help you:",
+                    styles['composition_prompt']
+                ))
+                for gq in guiding:
+                    story.append(Paragraph(f"- {_esc(gq)}", styles['guiding_q']))
+            for _ in range(4):
+                story.append(Paragraph(DOTS, styles['dots']))
 
-            if section['type'] == 'composition':
-                content = section.get('content', {})
-                if isinstance(content, dict):
-                    prompt = content.get('prompt', '')
-                    guiding = content.get('guiding_questions', [])
+        elif section['type'] == 'mcq':
+            marks_str = f"  ({marks} marks)" if marks else ""
+            story.append(Paragraph(
+                f"<b><u>- Choose the correct answer A, B, C or D:</u></b>{marks_str}",
+                styles['section_header']
+            ))
+            for item in section.get('items', []):
+                if isinstance(item, dict):
+                    stem = item.get('stem', '')
+                    options = item.get('options', [])
+                    story.append(Paragraph(
+                        f"{q_num}. {_esc(stem)}", styles['mcq_stem']
+                    ))
+                    if options:
+                        opts_line = "    ".join(_esc(o) for o in options)
+                        story.append(Paragraph(opts_line, styles['mcq_opts']))
                 else:
-                    prompt = str(content)
-                    guiding = []
-                story.append(Paragraph(_esc(prompt), styles['composition_prompt']))
-                if guiding:
                     story.append(Paragraph(
-                        "The answers of these questions can help you:",
-                        styles['composition_prompt']
+                        f"{q_num}. {_esc(str(item))}", styles['question']
                     ))
-                    for gidx, gq in enumerate(guiding, 1):
-                        story.append(Paragraph(
-                            f"{gidx}. {_esc(gq)}",
-                            styles['guiding_q']
-                        ))
+                q_num += 1
 
-            elif section['type'] == 'mcq':
-                # MCQ with a) b) c) d) options - format like sample
-                for idx, item in enumerate(section.get('items', []), 1):
-                    if isinstance(item, dict):
-                        stem = item.get('stem', '')
-                        options = item.get('options', [])
-                        # Stem with number
-                        story.append(Paragraph(
-                            f"{idx}. {_esc(stem)}",
-                            styles['question']
-                        ))
-                        if options:
-                            opts_text = "    ".join(_esc(o) for o in options)
-                            story.append(Paragraph(
-                                opts_text,
-                                styles['mcq_options']
-                            ))
-                    else:
-                        story.append(Paragraph(
-                            f"{idx}. {_esc(str(item))}",
-                            styles['question']
-                        ))
-
-            elif section['type'] == 'do_as_required':
-                # Grammar items with individual instructions
-                for idx, item in enumerate(section.get('items', []), 1):
-                    if isinstance(item, dict):
-                        sentence = item.get('sentence', '')
-                        instruction = item.get('instruction', '')
-                        display = f"{_esc(sentence)}"
-                        if instruction:
-                            display += f"    <b>({_esc(instruction)})</b>"
-                        story.append(Paragraph(
-                            f"{idx}. {display}",
-                            styles['question']
-                        ))
-                    else:
-                        story.append(Paragraph(
-                            f"{idx}. {_esc(str(item))}",
-                            styles['question']
-                        ))
-
-            elif 'items' in section:
-                for idx, item in enumerate(section.get('items', []), 1):
-                    if isinstance(item, dict):
-                        display = item.get('word', item.get('definition', str(item)))
-                    else:
-                        display = str(item)
+        elif section['type'] == 'do_as_required':
+            marks_str = f"  ({marks} marks)" if marks else ""
+            title = section.get('title', 'Do as required:')
+            story.append(Paragraph(
+                f"<b><u>- {_esc(title)}</u></b>{marks_str}",
+                styles['section_header']
+            ))
+            for item in section.get('items', []):
+                if isinstance(item, dict):
+                    sentence = item.get('sentence', '')
+                    instruction = item.get('instruction', '')
+                    display = f"{q_num}. {_esc(sentence)}"
+                    if instruction:
+                        display += f"  <b>({_esc(instruction)})</b>"
+                    story.append(Paragraph(display, styles['question']))
+                else:
                     story.append(Paragraph(
-                        f"{idx}. {_esc(display)}",
-                        styles['question']
+                        f"{q_num}. {_esc(str(item))}", styles['question']
                     ))
+                story.append(Paragraph(DOTS, styles['dots']))
+                q_num += 1
 
-    # Footer
-    story.append(Spacer(1, 3 * mm))
-    story.append(Paragraph("The End Of The Questions", styles['footer']))
+        else:
+            marks_str = f"  ({marks} marks)" if marks else ""
+            title = section.get('title', '')
+            story.append(Paragraph(
+                f"<b><u>- {_esc(title)}</u></b>{marks_str}",
+                styles['section_header']
+            ))
+            for item in section.get('items', []):
+                if isinstance(item, dict):
+                    display = item.get('word', item.get('definition', str(item)))
+                else:
+                    display = str(item)
+                story.append(Paragraph(
+                    f"{q_num}. {_esc(display)}", styles['question']
+                ))
+                story.append(Paragraph(DOTS, styles['dots']))
+                q_num += 1
 
-    return story
+    return story, sec_num, q_num
 
 
-class _ExamDocTemplate(BaseDocTemplate):
-    """Custom doc template that draws per-exam headers."""
+def _render_column_on_canvas(canvas, flowables, x, y_top, width, height):
+    """Render a list of flowables into a rectangular area on the canvas.
 
-    def __init__(self, buffer, exam_info, **kwargs):
-        self.exam_info = exam_info
-        super().__init__(buffer, **kwargs)
+    Returns the remaining y position after rendering (how far down we got).
+    Uses Frame to handle wrapping and overflow.
+    """
+    from reportlab.platypus.frames import Frame as RLFrame
 
-    def afterPage(self):
-        """Called after each page is done."""
-        pass
+    f = RLFrame(x, y_top - height, width, height,
+                leftPadding=1 * mm, rightPadding=1 * mm,
+                topPadding=0, bottomPadding=0,
+                showBoundary=0)
 
+    # addFromList modifies the list in place - removes items that fit
+    remaining = list(flowables)  # copy
+    f.addFromList(remaining, canvas)
 
-def _make_two_col_template(exam_info):
-    """Create a two-column PageTemplate with header callback."""
-
-    col_top = MARGIN_BOTTOM + COL_H
-
-    frame_left = Frame(
-        MARGIN_LEFT, MARGIN_BOTTOM,
-        COL_W, COL_H,
-        id='left',
-        leftPadding=0, rightPadding=2 * mm,
-        topPadding=0, bottomPadding=0,
-    )
-    frame_right = Frame(
-        MARGIN_LEFT + COL_W + GUTTER, MARGIN_BOTTOM,
-        COL_W, COL_H,
-        id='right',
-        leftPadding=2 * mm, rightPadding=0,
-        topPadding=0, bottomPadding=0,
-    )
-
-    def on_page(canvas, doc):
-        _draw_header(canvas, doc, exam_info)
-
-    return PageTemplate(
-        id='twocol',
-        frames=[frame_left, frame_right],
-        onPage=on_page,
-    )
+    return remaining  # items that didn't fit
 
 
 def generate_exam_pdf(exam, teacher_name="", exam_year="2025-2026"):
-    """Generate a PDF for a single exam with two-column layout."""
+    """Generate a PDF for a single exam."""
     buffer = io.BytesIO()
 
+    total_marks = exam.get('total_marks', 0)
     exam_info = {
-        'unit_num': exam['unit_num'],
-        'unit_name': exam['unit_name'],
-        'exam_year': exam_year,
+        'total_marks': total_marks,
         'teacher_name': teacher_name,
-        'total_marks': exam['total_marks'],
+        'model_num': '',
     }
 
-    doc = _ExamDocTemplate(
-        buffer, exam_info,
-        pagesize=A4,
-        topMargin=MARGIN_TOP + HEADER_HEIGHT,
-        bottomMargin=MARGIN_BOTTOM,
-        leftMargin=MARGIN_LEFT,
-        rightMargin=MARGIN_RIGHT,
-    )
-
-    template = _make_two_col_template(exam_info)
-    doc.addPageTemplates([template])
-
+    from reportlab.pdfgen import canvas as canvas_module
+    c = canvas_module.Canvas(buffer, pagesize=A4)
     styles = _styles()
-    story = _build_exam_story(exam, styles)
 
-    doc.build(story)
+    col_y_top = PAGE_H - MARGIN_TOP - HEADER_HEIGHT - 2 * mm
+    col_height = col_y_top - MARGIN_BOTTOM
+
+    flowables, _, _ = _build_column_flowables(exam, styles)
+    flowables.append(Spacer(1, 3 * mm))
+    flowables.append(Paragraph("The End Of The Questions", styles['footer']))
+
+    page_num = 0
+    while flowables:
+        if page_num > 0:
+            c.showPage()
+        _draw_header(c, exam_info)
+
+        remaining = _render_column_on_canvas(
+            c, flowables, MARGIN_LEFT, col_y_top, CONTENT_W, col_height
+        )
+        flowables = remaining
+        page_num += 1
+        if page_num > 20:
+            break
+
+    c.showPage()
+    c.save()
     result = buffer.getvalue()
     buffer.close()
     return result
 
 
 def generate_combined_pdf(textbook_exam, activity_exam, teacher_name="", exam_year="2025-2026"):
-    """Generate a single PDF containing both exams with two-column layout."""
-    buffer = io.BytesIO()
-
-    # We need to handle two different exams with different headers.
-    # Use a single doc with page templates that switch between exams.
-
-    tb_info = {
-        'unit_num': textbook_exam['unit_num'],
-        'unit_name': textbook_exam['unit_name'],
-        'exam_year': exam_year,
-        'teacher_name': teacher_name,
-        'total_marks': textbook_exam['total_marks'],
-        'source_label': 'Student Book',
-    }
-    act_info = {
-        'unit_num': activity_exam['unit_num'],
-        'unit_name': activity_exam['unit_name'],
-        'exam_year': exam_year,
-        'teacher_name': teacher_name,
-        'total_marks': activity_exam['total_marks'],
-        'source_label': 'Activity Book',
-    }
-
-    doc = BaseDocTemplate(
-        buffer,
-        pagesize=A4,
-        topMargin=MARGIN_TOP + HEADER_HEIGHT,
-        bottomMargin=MARGIN_BOTTOM,
-        leftMargin=MARGIN_LEFT,
-        rightMargin=MARGIN_RIGHT,
+    """Generate a single PDF with two exams side by side in two columns."""
+    return generate_multi_exam_pdf(
+        [textbook_exam, activity_exam],
+        teacher_name=teacher_name,
+        exam_year=exam_year,
     )
-
-    # Template for Exam A
-    tb_template = _make_two_col_template(tb_info)
-    tb_template.id = 'exam_a'
-
-    # Template for Exam B
-    act_template = _make_two_col_template(act_info)
-    act_template.id = 'exam_b'
-
-    doc.addPageTemplates([tb_template, act_template])
-
-    styles = _styles()
-    story = []
-
-    # Exam A label + content
-    story.append(Paragraph(
-        "<b>Exam A - Student Book</b>",
-        styles['source_label']
-    ))
-    story.extend(_build_exam_story(textbook_exam, styles))
-
-    # Switch to Exam B template and start new page
-    from reportlab.platypus.doctemplate import NextPageTemplate
-    story.append(NextPageTemplate('exam_b'))
-    story.append(PageBreak())
-
-    # Exam B label + content
-    story.append(Paragraph(
-        "<b>Exam B - Activity Book</b>",
-        styles['source_label']
-    ))
-    story.extend(_build_exam_story(activity_exam, styles))
-
-    doc.build(story)
-    result = buffer.getvalue()
-    buffer.close()
-    return result
 
 
 def generate_multi_exam_pdf(exams, teacher_name="", exam_year="2025-2026"):
-    """Generate a single PDF containing multiple exams from different units/books.
+    """Generate a single PDF with exams in two-column pairs.
 
-    Args:
-        exams: List of exam dicts (from build_exam or build_mixed_exam)
-        teacher_name: Teacher name for header
-        exam_year: Academic year for header
-
-    Returns:
-        PDF bytes
+    Every two exams are placed side by side (left/right columns) on the same
+    page(s). Content that overflows continues on subsequent pages.
     """
     if not exams:
         return b""
-    if len(exams) == 1:
-        return generate_exam_pdf(exams[0], teacher_name=teacher_name, exam_year=exam_year)
 
     buffer = io.BytesIO()
-
-    infos = []
-    templates = []
-    for i, exam in enumerate(exams):
-        info = {
-            'unit_num': exam['unit_num'],
-            'unit_name': exam['unit_name'],
-            'exam_year': exam_year,
-            'teacher_name': teacher_name,
-            'total_marks': exam['total_marks'],
-            'source_label': exam.get('source_label', ''),
-        }
-        infos.append(info)
-        tmpl = _make_two_col_template(info)
-        tmpl.id = f'exam_{i}'
-        templates.append(tmpl)
-
-    doc = BaseDocTemplate(
-        buffer,
-        pagesize=A4,
-        topMargin=MARGIN_TOP + HEADER_HEIGHT,
-        bottomMargin=MARGIN_BOTTOM,
-        leftMargin=MARGIN_LEFT,
-        rightMargin=MARGIN_RIGHT,
-    )
-    doc.addPageTemplates(templates)
-
     styles = _styles()
-    story = []
 
-    from reportlab.platypus.doctemplate import NextPageTemplate
+    total_marks = sum(e.get('total_marks', 0) for e in exams)
+    exam_info = {
+        'total_marks': total_marks,
+        'teacher_name': teacher_name,
+        'model_num': '',
+    }
 
-    for i, exam in enumerate(exams):
-        if i > 0:
-            story.append(NextPageTemplate(f'exam_{i}'))
-            story.append(PageBreak())
+    from reportlab.pdfgen import canvas as canvas_module
+    c = canvas_module.Canvas(buffer, pagesize=A4)
 
-        label = f"Exam {chr(65 + i)} - {exam.get('source_label', '')} (Unit {exam['unit_num']})"
-        story.append(Paragraph(
-            f"<b>{_esc(label)}</b>",
-            styles['source_label']
-        ))
-        story.extend(_build_exam_story(exam, styles, page_split=True))
+    col_y_top = PAGE_H - MARGIN_TOP - HEADER_HEIGHT - 2 * mm
+    col_height = col_y_top - MARGIN_BOTTOM
+    left_x = MARGIN_LEFT
+    right_x = MARGIN_LEFT + COL_W + GUTTER
 
-    doc.build(story)
+    sec_num = 1
+    q_num = 1
+
+    # Process exams in pairs
+    i = 0
+    while i < len(exams):
+        if i + 1 < len(exams):
+            # Two exams side by side
+            left_flows, sec_num, q_num = _build_column_flowables(
+                exams[i], styles, sec_num, q_num
+            )
+            right_flows, sec_num, q_num = _build_column_flowables(
+                exams[i + 1], styles, sec_num, q_num
+            )
+
+            # Render both columns, handling overflow across pages
+            page_num = 0
+            while left_flows or right_flows:
+                if page_num > 0:
+                    c.showPage()
+                _draw_header(c, exam_info)
+
+                # Draw vertical separator line
+                sep_x = MARGIN_LEFT + COL_W + GUTTER / 2
+                c.setStrokeColor(colors.black)
+                c.setLineWidth(0.3)
+                c.line(sep_x, col_y_top, sep_x, MARGIN_BOTTOM)
+
+                # Render left column
+                if left_flows:
+                    left_flows = _render_column_on_canvas(
+                        c, left_flows, left_x, col_y_top, COL_W, col_height
+                    )
+                # Render right column
+                if right_flows:
+                    right_flows = _render_column_on_canvas(
+                        c, right_flows, right_x, col_y_top, COL_W, col_height
+                    )
+
+                page_num += 1
+                if page_num > 20:
+                    break
+
+            i += 2
+        else:
+            # Single exam - full width
+            flows, sec_num, q_num = _build_column_flowables(
+                exams[i], styles, sec_num, q_num
+            )
+            flows.append(Spacer(1, 3 * mm))
+            flows.append(Paragraph("The End Of The Questions", styles['footer']))
+
+            page_num = 0
+            while flows:
+                if page_num > 0:
+                    c.showPage()
+                _draw_header(c, exam_info)
+                flows = _render_column_on_canvas(
+                    c, flows, MARGIN_LEFT, col_y_top, CONTENT_W, col_height
+                )
+                page_num += 1
+                if page_num > 20:
+                    break
+            i += 1
+
+    # Add footer on current page if we haven't already (even number of exams)
+    if len(exams) % 2 == 0:
+        footer_flows = [Spacer(1, 3 * mm),
+                        Paragraph("The End Of The Questions", styles['footer'])]
+        _render_column_on_canvas(
+            c, footer_flows, MARGIN_LEFT, MARGIN_BOTTOM + 20 * mm,
+            CONTENT_W, 20 * mm
+        )
+
+    c.showPage()
+    c.save()
     result = buffer.getvalue()
     buffer.close()
     return result
